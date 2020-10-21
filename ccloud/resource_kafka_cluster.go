@@ -3,8 +3,10 @@ package ccloud
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
+	"github.com/Shopify/sarama"
 	ccloud "github.com/cgroschupp/go-client-confluent-cloud/confluentcloud"
 	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
@@ -141,19 +143,14 @@ func clusterCreate(d *schema.ResourceData, meta interface{}) error {
 	}
 	d.SetId(cluster.ID)
 
-	stateConf := &resource.StateChangeConf{
-		Pending:      []string{"Pending"},
-		Target:       []string{"Ready"},
-		Refresh:      clusterReady(c, d.Id(), accountID),
-		Timeout:      300 * time.Second,
-		Delay:        3 * time.Second,
-		PollInterval: 2 * time.Second,
-		MinTimeout:   20 * time.Second,
+	logicalClusters := []ccloud.LogicalCluster{
+		ccloud.LogicalCluster{ID: cluster.ID},
 	}
-	_, err = stateConf.WaitForState()
 
-	if err != nil {
-		return fmt.Errorf("Error waiting for cluster (%s) to be ready: %s", d.Id(), err)
+	apiKeyReq := ccloud.ApiKeyCreateRequest{
+		AccountID:       accountID,
+		LogicalClusters: logicalClusters,
+		Description:     "terraform-provider-kafka cluster connection bootstrap",
 	}
 
 	err = d.Set("bootstrap_servers", cluster.Endpoint)
@@ -161,14 +158,40 @@ func clusterCreate(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
+	key, err := c.CreateAPIKey(&apiKeyReq)
+	if err != nil {
+		return err
+	}
+
+	stateConf := &resource.StateChangeConf{
+		Pending:      []string{"Pending"},
+		Target:       []string{"Ready"},
+		Refresh:      clusterReady(c, d.Id(), accountID, key.Key, key.Secret),
+		Timeout:      300 * time.Second,
+		Delay:        3 * time.Second,
+		PollInterval: 5 * time.Second,
+		MinTimeout:   20 * time.Second,
+	}
+
+	_, err = stateConf.WaitForState()
+	if err != nil {
+		return fmt.Errorf("Error waiting for cluster (%s) to be ready: %s", d.Id(), err)
+	}
+
+	//err = c.DeleteAPIKey(key.ID, accountID, logicalClusters)
+	//if err != nil {
+	//log.Printf("[ERROR] Unable to delete bootstrap api key %s", err)
+	//}
+
 	return nil
 }
 
-func clusterReady(client *ccloud.Client, clusterID, accountID string) resource.StateRefreshFunc {
+func clusterReady(client *ccloud.Client, clusterID, accountID, username, password string) resource.StateRefreshFunc {
 	return func() (result interface{}, s string, err error) {
 		cluster, err := client.GetCluster(clusterID, accountID)
 
 		log.Printf("[DEBUG] Waiting for Cluster to be UP: current status %s", cluster.Status)
+		log.Printf("[DEBUG] cluster %v", cluster)
 		log.Printf("[DEBUG] Can we connect to %s, created %s", cluster.Endpoint, cluster.Deployment.Created)
 
 		if err != nil {
@@ -176,8 +199,7 @@ func clusterReady(client *ccloud.Client, clusterID, accountID string) resource.S
 		}
 
 		if cluster.Status == "UP" {
-			// this doesn't actually mean it's ready to receive requests :(
-			if canConnect(cluster.Endpoint) {
+			if canConnect(cluster.Endpoint, username, password) {
 				return cluster, "Ready", nil
 			}
 		}
@@ -186,9 +208,31 @@ func clusterReady(client *ccloud.Client, clusterID, accountID string) resource.S
 	}
 }
 
-func canConnect(connection string) bool {
-	time.Sleep(90 * time.Second)
+func canConnect(connection, username, password string) bool {
+	bootstrapServers := strings.Replace(connection, "SASL_SSL://", "", 1)
+	log.Printf("[INFO] Trying to connect to %s", bootstrapServers)
 
+	cfg := sarama.NewConfig()
+	cfg.Net.SASL.Enable = true
+	cfg.Net.SASL.User = username
+	cfg.Net.SASL.Password = password
+	cfg.Net.SASL.Handshake = true
+	cfg.Net.TLS.Enable = true
+
+	client, err := sarama.NewClient([]string{bootstrapServers}, cfg)
+
+	if err != nil {
+		log.Printf("[ERROR] Could not build client %s", err)
+		return false
+	}
+
+	err = client.RefreshMetadata()
+	if err != nil {
+		log.Printf("[ERROR] Could not refresh metadata %s", err)
+		return false
+	}
+
+	log.Printf("[INFO] Success! Connected to %s", bootstrapServers)
 	return true
 }
 
