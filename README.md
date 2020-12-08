@@ -12,7 +12,10 @@ your [terraform plugin directory][third-party-plugins] (typically `~/.terraform.
 Configure the provider directly, or set the ENV variables `CONFLUENT_CLOUD_USERNAME` &`CONFLUENT_CLOUD_PASSWORD`
 
 ```hcl
-provider "confluentcloud" {}
+provider "confluentcloud" {
+  username = "ccloud@example.org"
+  password = "hunter2"
+}
 
 resource "confluentcloud_environment" "environment" {
   name = "default"
@@ -24,6 +27,16 @@ resource "confluentcloud_kafka_cluster" "test" {
   region           = "eu-west-1"
   availability     = "LOW"
   environment_id   = confluentcloud_environment.environment.id
+}
+
+resource "confluentcloud_schema_registry" "test" {
+  environment_id   = confluentcloud_environment.environment.id
+  service_provider = "aws"
+  region           = "EU"
+
+  # Requires at least one kafka cluster to enable 
+  # schema registry in the environment.
+  depends_on       = [confluentcloud_kafka_cluster.test]
 }
 
 resource "confluentcloud_api_key" "provider_test" {
