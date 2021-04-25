@@ -1,21 +1,26 @@
 package ccloud
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"strings"
+	"time"
 
+	"github.com/Shopify/sarama"
 	ccloud "github.com/cgroschupp/go-client-confluent-cloud/confluentcloud"
-	"github.com/hashicorp/terraform/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/resource"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 )
 
 func kafkaClusterResource() *schema.Resource {
 	return &schema.Resource{
-		Create: clusterCreate,
-		Read:   clusterRead,
-		//Update: clusterUpdate,
-		Delete: clusterDelete,
+		CreateContext: clusterCreate,
+		ReadContext:   clusterRead,
+		DeleteContext: clusterDelete,
 		Importer: &schema.ResourceImporter{
-			State: schema.ImportStatePassthrough,
+			StateContext: schema.ImportStatePassthroughContext,
 		},
 		Schema: map[string]*schema.Schema{
 			"name": {
@@ -81,14 +86,9 @@ func kafkaClusterResource() *schema.Resource {
 				Type:        schema.TypeMap,
 				Optional:    true,
 				ForceNew:    true,
-				Description: "Deployment settings.  Currently only `sku` is supported.",
-				Elem: &schema.Resource{
-					Schema: map[string]*schema.Schema{
-						"sku": {
-							Type:     schema.TypeString,
-							Required: true,
-						},
-					},
+				Description: "Deployment settings. Currently only `sku` is supported.",
+				Elem: &schema.Schema{
+					Type:     schema.TypeString,
 				},
 			},
 			"cku": {
@@ -96,12 +96,12 @@ func kafkaClusterResource() *schema.Resource {
 				Optional:    true,
 				ForceNew:    true,
 				Description: "cku",
-				},
+			},
 		},
 	}
 }
 
-func clusterCreate(d *schema.ResourceData, meta interface{}) error {
+func clusterCreate(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	c := meta.(*ccloud.Client)
 
 	name := d.Get("name").(string)
@@ -143,32 +143,112 @@ func clusterCreate(d *schema.ResourceData, meta interface{}) error {
 	cluster, err := c.CreateCluster(req)
 	if err != nil {
 		log.Printf("[ERROR] createCluster failed %v, %s", req, err)
-		return err
+		return diag.FromErr(err)
 	}
-
 	d.SetId(cluster.ID)
+	log.Printf("[DEBUG] Created kafka_cluster %s, Endpoint: %s", cluster.ID, cluster.Endpoint)
+
 	err = d.Set("bootstrap_servers", cluster.Endpoint)
 	if err != nil {
-		return err
+		return diag.FromErr(err)
+	}
+
+	logicalClusters := []ccloud.LogicalCluster{
+		ccloud.LogicalCluster{ID: cluster.ID},
+	}
+
+	apiKeyReq := ccloud.ApiKeyCreateRequest{
+		AccountID:       accountID,
+		LogicalClusters: logicalClusters,
+		Description:     "terraform-provider-confluentcloud cluster connection bootstrap",
+	}
+
+	log.Printf("[DEBUG] Creating bootstrap keypair")
+	key, err := c.CreateAPIKey(&apiKeyReq)
+	if err != nil {
+		return diag.FromErr(err)
+	}
+
+	stateConf := &resource.StateChangeConf{
+		Pending:      []string{"Pending"},
+		Target:       []string{"Ready"},
+		Refresh:      clusterReady(c, d.Id(), accountID, key.Key, key.Secret),
+		Timeout:      1800 * time.Second,
+		Delay:        3 * time.Second,
+		PollInterval: 5 * time.Second,
+		MinTimeout:   20 * time.Second,
+	}
+
+	log.Printf("[DEBUG] Waiting for cluster to become healthy")
+	_, err = stateConf.WaitForStateContext(ctx)
+	if err != nil {
+		return diag.FromErr(fmt.Errorf("Error waiting for cluster (%s) to be ready: %s", d.Id(), err))
+	}
+
+	log.Printf("[DEBUG] Deleting bootstrap keypair")
+	err = c.DeleteAPIKey(fmt.Sprintf("%d", key.ID), accountID, logicalClusters)
+	if err != nil {
+		log.Printf("[ERROR] Unable to delete bootstrap api key %s", err)
 	}
 
 	return nil
 }
 
-func clusterDelete(d *schema.ResourceData, meta interface{}) error {
-	c := meta.(*ccloud.Client)
-	accountID := d.Get("environment_id").(string)
+func clusterReady(client *ccloud.Client, clusterID, accountID, username, password string) resource.StateRefreshFunc {
+	return func() (result interface{}, s string, err error) {
+		cluster, err := client.GetCluster(clusterID, accountID)
+		log.Printf("[DEBUG] Waiting for Cluster to be UP: current status %s %s:%s", cluster.Status, username, password)
+		log.Printf("[DEBUG] cluster %v", cluster)
 
-	return c.DeleteCluster(d.Id(), accountID)
+		if err != nil {
+			return cluster, "UNKNOWN", err
+		}
+
+		log.Printf("[DEBUG] Attempting to connect to %s, created %s", cluster.Endpoint, cluster.Deployment.Created)
+		if cluster.Status == "UP" {
+			if canConnect(cluster.Endpoint, username, password) {
+				return cluster, "Ready", nil
+			}
+		}
+
+		return cluster, "Pending", nil
+	}
 }
 
-func clusterRead(d *schema.ResourceData, meta interface{}) error {
+func canConnect(connection, username, password string) bool {
+	client, err := kafkaClient(connection, username, password)
+	if err != nil {
+		log.Printf("[ERROR] Could not build client %s", err)
+		return false
+	}
+
+	err = client.RefreshMetadata()
+	if err != nil {
+		log.Printf("[ERROR] Could not refresh metadata %s", err)
+		return false
+	}
+
+	log.Printf("[INFO] Success! Connected to %s", connection)
+	return true
+}
+
+func clusterDelete(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
+	c := meta.(*ccloud.Client)
+	accountID := d.Get("environment_id").(string)
+	var diags diag.Diagnostics
+
+	if err := c.DeleteCluster(d.Id(), accountID); err != nil {
+		return diag.FromErr(err)
+	}
+	return diags
+}
+
+func clusterRead(ctx context.Context, d *schema.ResourceData, meta interface{}) diag.Diagnostics {
 	c := meta.(*ccloud.Client)
 	accountID := d.Get("environment_id").(string)
 
 	cluster, err := c.GetCluster(d.Id(), accountID)
 	if err == nil {
-		log.Printf("[WARN] hello %s", cluster.APIEndpoint)
 		err = d.Set("bootstrap_servers", cluster.Endpoint)
 	}
 	if err == nil {
@@ -184,7 +264,7 @@ func clusterRead(d *schema.ResourceData, meta interface{}) error {
 		err = d.Set("availability", cluster.Durability)
 	}
 	if err == nil {
-		err = d.Set("deployment", map[string]interface{}{ "sku": cluster.Deployment.Sku })
+		err = d.Set("deployment", map[string]interface{}{"sku": cluster.Deployment.Sku})
 	}
 	if err == nil {
 		err = d.Set("storage", cluster.Storage)
@@ -198,5 +278,20 @@ func clusterRead(d *schema.ResourceData, meta interface{}) error {
 	if err == nil {
 		err = d.Set("cku", cluster.Cku)
 	}
-	return err
+
+	return diag.FromErr(err)
+}
+
+func kafkaClient(connection, username, password string) (sarama.Client, error) {
+	bootstrapServers := strings.Replace(connection, "SASL_SSL://", "", 1)
+	log.Printf("[INFO] Trying to connect to %s", bootstrapServers)
+
+	cfg := sarama.NewConfig()
+	cfg.Net.SASL.Enable = true
+	cfg.Net.SASL.User = username
+	cfg.Net.SASL.Password = password
+	cfg.Net.SASL.Handshake = true
+	cfg.Net.TLS.Enable = true
+
+	return sarama.NewClient([]string{bootstrapServers}, cfg)
 }
